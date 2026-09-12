@@ -245,6 +245,47 @@ def find_imm_tail(ins, i, j, orig: bytes, gap):
     return None
 
 
+# ---------- 引用来源（按符号表判断引用代码属于哪个 crate） ----------
+UI_CRATES = {'delta', 'delta_app', 'delta_settings_ui', 'delta_appearance', 'thread_view', 'ui', 'editor6',
+             'diff_view', 'log_viewer', 'tools_ui', 'pane', 'picker', 'inspector', 'document_ui',
+             'inline_terminal', 'text_input', 'gpui', 'gpui_macos', 'markdown'}
+NON_UI_CRATES = {'versioned', 'serde', 'serde_json', 'serde_core', 'html5ever', 'cssparser', 'merman_core', 'merman',
+                 'hyper', 'http', 'tungstenite', 'reqwest', 'rustls', 'deltadb', 'delta_remote', 'thread',
+                 'agent_skills', 'tools', 'language_model', 'language_model_core', 'language_models_cloud', 'open_ai',
+                 'copilot_chat', 'cloud_api_client', 'redaction', 'agent', 'delta_runner', 'local_turns', 'apply_patch',
+                 'diff_store', 'comment_set', 'proxy_handshake', 'http_client', 'reqwest_client', 'github',
+                 'askpass', 'fs', 'worktree_mount', 'delta_telemetry', 'openai_subscribed', 'mermaid_render',
+                 'html_to_markdown', 'language', 'language_core', 'toml', 'toml_edit', 'clap', 'clap_builder',
+                 'agent_profiles', 'acp', 'agent_client_protocol', 'scheduler', 'git', 'git2', 'sqlite', 'rusqlite'}
+NON_UI_MODULES = ('thread_formatter', 'transcript', 'schema', 'serde', 'serialize', 'deserialize')
+_CRATE_RE = re.compile(r'C(?:s[0-9A-Za-z]+_)?(\d+)([A-Za-z_][A-Za-z0-9_]*)')
+
+
+def symbol_crates(sym: str):
+    """从 Rust v0 混淆符号里提取涉及的 crate 名。"""
+    out = set()
+    for ln, rest in _CRATE_RE.findall(sym):
+        n = int(ln)
+        if 0 < n <= len(rest): out.add(rest[:n])
+    return out
+
+
+class FunctionTable:
+    """代码地址 -> 所在函数的符号（用 nm 读符号表）。"""
+    def __init__(self, exe):
+        import bisect
+        self.addrs, self.names = [], []
+        r = subprocess.run(['nm', '-n', '--defined-only', exe], capture_output=True, text=True)
+        for line in r.stdout.splitlines():
+            parts = line.split(' ', 2)
+            if len(parts) == 3 and parts[1] in ('T', 't'):
+                self.addrs.append(int(parts[0], 16)); self.names.append(parts[2])
+        self._bisect = bisect
+    def lookup(self, pc):
+        i = self._bisect.bisect_right(self.addrs, pc) - 1
+        return self.names[i] if i >= 0 else ''
+
+
 # ---------- 分析 ----------
 class Literal:
     __slots__ = ('addr', 'off', 'len', 'text', 'exact', 'refs', 'cands')
@@ -484,7 +525,7 @@ def load_dict(path):
             if not k.startswith('_') and v}
 
 
-def make_plan(m: MachO, table, verbose=False):
+def make_plan(m: MachO, table, exe_for_symbols=None):
     lits, ins, (text_addr, text_off) = analyze(m)
     by_text = defaultdict(list)
     for lit in lits: by_text[lit.text].append(lit)
@@ -515,13 +556,49 @@ def make_plan(m: MachO, table, verbose=False):
                     out.append((q, kind, nb[gap[0]:gap[1]]))
         return out
 
+    PROTOCOL_TOKENS = {'Upgrade', 'Host', 'Accept', 'Content-Type', 'Content-Length', 'Authorization', 'User-Agent',
+                       'Keep-Alive', 'Connection', 'Sec-WebSocket-Key', 'Sec-WebSocket-Accept', 'Sec-WebSocket-Version',
+                       'Sec-WebSocket-Protocol', 'Transfer-Encoding', 'Cookie', 'Origin', 'Location', 'Date', 'Server'}
+    by_addr = sorted(lits, key=lambda l: l.addr)
+    idx = {l.addr: n for n, l in enumerate(by_addr)}
+
+    def protocol_cluster(lit):
+        """和 HTTP 头名挨在一起的字面量多半也是协议 token（相同的词在别处可能是界面文字）。"""
+        n = idx[lit.addr]
+        for k in range(max(0, n - 3), min(len(by_addr), n + 4)):
+            o = by_addr[k]
+            if o is not lit and abs(o.addr - lit.addr) <= 96 and o.text in PROTOCOL_TOKENS:
+                return True
+        return False
+
+    ftab = FunctionTable(exe_for_symbols) if exe_for_symbols else None
+
+    def non_ui_reference(lit):
+        """任一代码引用来自序列化/协议/解析器 crate（且不来自 UI crate）→ 这条字面量不只是界面文字。"""
+        if not ftab: return False
+        for r in lit.refs:
+            if r[0] not in ('code', 'copy', 'load', 'derived'): continue
+            sym = ftab.lookup(text_addr + r[1] * 4)
+            crates = symbol_crates(sym)
+            if crates & NON_UI_CRATES and not (crates & UI_CRATES):
+                return True
+            if any(mod in sym for mod in NON_UI_MODULES) and not (crates & UI_CRATES):
+                return True
+        return False
+
     def inplace_safe(lit):
+        if non_ui_reference(lit): return False
+        if ' ' not in lit.text and protocol_cluster(lit): return False   # 含空格的必然是界面文字
         code = [r for r in lit.refs if r[0] in ('code', 'copy')]
         if lit.exact: return True
         if any(r[0] == 'load' for r in lit.refs): return False
         if any(r[0] in ('derived', 'ptr') for r in lit.refs) and not code: return False
         return bool(code) and all(any(imm == lit.len for _, imm in r[3]) for r in code)
 
+    _rng = os.environ.get('DELTA_I18N_ONLY_RANGE')          # 调试用：只处理该地址范围内的字面量
+    if _rng:
+        _lo, _hi = (int(x, 16) for x in _rng.split('-'))
+        by_text = defaultdict(list, {t: [l for l in ls if _lo <= l.addr < _hi] for t, ls in by_text.items()})
     for en, zh in table.items():
         hits = [l for l in by_text.get(en, []) if inplace_safe(l)]
         if not hits:
@@ -543,7 +620,7 @@ def make_plan(m: MachO, table, verbose=False):
                 if utf8_consistent(lit, nb) and cp is not None: inplace.append((lit, nb, cp)); done += 1
                 continue
             patches = []
-            ok = bool(lit.refs)
+            ok = bool(lit.refs) and not non_ui_reference(lit)
             for r in lit.refs:
                 if r[0] == 'fat':
                     patches.append(r)
@@ -642,7 +719,7 @@ def do_apply(app, dict_path, dry):
     data, from_backup = original_binary(app)
     m = MachO(data)
     table = load_dict(dict_path)
-    plan = make_plan(m, table)
+    plan = make_plan(m, table, exe_path(app))
     report(plan, table)
     if dry: return
     out = apply_plan(m, plan)
