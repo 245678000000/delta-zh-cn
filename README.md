@@ -15,7 +15,7 @@ Delta 是闭源应用，界面文字直接编译在主程序二进制里，官�
 要求：macOS（Apple Silicon）、已安装 Delta、Python 3 与 numpy。
 
 ```bash
-git clone https://github.com/<你的用户名>/delta-zh-cn.git
+git clone https://github.com/245678000000/delta-zh-cn.git
 cd delta-zh-cn
 pip3 install numpy          # 只需要这一个依赖
 ```
