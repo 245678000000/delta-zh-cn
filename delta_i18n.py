@@ -182,6 +182,68 @@ def reg_consumed(w, reg):
     return False
 
 
+def load_size(w):
+    """返回 load 指令的访问宽度（字节）。"""
+    if is_ldr_uimm(w) or is_ldur(w):
+        size = (w >> 30) & 3; V = (w >> 26) & 1; opc = (w >> 22) & 3
+        if V and opc == 3 and size == 0: return 16
+        return 1 << size
+    if is_ldp(w):
+        return 32 if (w & 0xFFC00000) == 0xAD400000 else (16 if (w >> 30) == 2 else 8)
+    return None
+
+
+def collect_loads(ins, start, base, base_rel, N):
+    """从 start 起扫描，收集以 base 寄存器为基址的加载：[(相对字面量起点的偏移, 宽度)]。
+    base_rel 是 base 寄存器相对字面量起点的偏移（页寄存器时为负）。遇到 base 被改写、
+    分支或调用即停止。"""
+    out = []
+    for q in range(start, min(start + 16, N)):
+        w = ins[q]
+        if ((w >> 5) & 0x1F) == base and (is_ldr_uimm(w) or is_ldur(w) or is_ldp(w)):
+            off = load_offset(w); sz = load_size(w)
+            if off is not None and sz:
+                out.append((off - base_rel, sz))
+                continue
+        if reg_written(w, base) or is_b(w) or is_bl(w) or is_ret_or_br(w) or is_bcond(w): break
+    return out
+
+
+def copy_gap(loads, n):
+    """加载覆盖 [0, n) 后剩下的未覆盖区间列表。"""
+    covered = [False] * n
+    for off, sz in loads:
+        for b in range(max(0, off), min(n, off + sz)): covered[b] = True
+    gaps, k = [], 0
+    while k < n:
+        if covered[k]: k += 1; continue
+        e = k
+        while e < n and not covered[e]: e += 1
+        gaps.append((k, e)); k = e
+    return gaps
+
+
+def find_imm_tail(ins, i, j, orig: bytes, gap):
+    """未被加载覆盖的尾部若由 movz(+movk) 立即数给出，返回 [(指令下标, 'z'|'k')]。"""
+    lo, hi = gap
+    n = hi - lo
+    if n not in (1, 2, 4): return None
+    val = int.from_bytes(orig[lo:hi], 'little')
+    N = len(ins)
+    for q in range(max(0, i - 6), min(j + 24, N)):
+        w = ins[q]
+        if is_movz(w) and ((w >> 5) & 0xFFFF) == (val & 0xFFFF):
+            if n <= 2: return [(q, 'z')]
+            reg = w & 0x1F
+            for q2 in range(q + 1, min(q + 6, N)):
+                w2 = ins[q2]
+                if (w2 & 0xFF800000) == 0x72800000 and ((w2 >> 21) & 3) == 1 and (w2 & 0x1F) == reg \
+                   and ((w2 >> 5) & 0xFFFF) == (val >> 16):                       # movk wN, #hi, lsl #16
+                    return [(q, 'z'), (q2, 'k')]
+            return None
+    return None
+
+
 # ---------- 分析 ----------
 class Literal:
     __slots__ = ('addr', 'off', 'len', 'text', 'exact', 'refs', 'cands')
@@ -234,7 +296,12 @@ def analyze(m: MachO):
                             imm16 = (w3 >> 5) & 0xFFFF
                             if 0 < imm16 < 8192 and target + imm16 <= const_end:
                                 lens[target].add(imm16); cands.append((k, imm16))
-                    refs[target].append(('code', i, j, cands))
+                    # 拷贝型引用：add 之后紧接着用 rd 作基址加载（把字面量拷进内联缓冲区）
+                    loads = collect_loads(ins_list, j + 1, rd, 0, N)
+                    if loads:
+                        refs[target].append(('copy', i, j, cands, loads))
+                    else:
+                        refs[target].append(('code', i, j, cands))
                     # 派生引用：`add xd, x<base>, #imm` 从同一基址算出相邻字面量
                     for q in range(j + 1, min(j + 48, N)):
                         w4 = ins_list[q]
@@ -256,7 +323,8 @@ def analyze(m: MachO):
                 if off is not None:
                     target = page + off
                     if const_addr <= target < const_end:
-                        refs[target].append(('load', i, j))
+                        loads = collect_loads(ins_list, j, rd, off, N)   # 以页寄存器为基址的一组加载
+                        refs[target].append(('load', i, j, loads))
             break
 
     # C) 解析每个起点的长度
@@ -300,7 +368,7 @@ def analyze(m: MachO):
         for r in lit.refs:
             if r[0] == 'fat':
                 strong.add(struct.unpack_from('<Q', data, r[1] + 8)[0])
-            elif r[0] == 'code':
+            elif r[0] in ('code', 'copy'):
                 for k, imm in r[3]:
                     if movz_tied_to_ptr(ins_list, r[2], k):
                         strong.add(imm)
@@ -431,10 +499,25 @@ def make_plan(m: MachO, table, verbose=False):
                 except UnicodeDecodeError: return False
         return True
 
+    def copy_patches(lit, nb):
+        """拷贝型引用：加载必须覆盖整个字面量，未覆盖的尾部必须是可改写的立即数。
+        返回需要改写的立即数指令列表，或 None 表示不安全。"""
+        orig = lit.text.encode('utf-8')
+        out = []
+        for r in lit.refs:
+            if r[0] not in ('copy', 'load'): continue
+            loads = r[4] if r[0] == 'copy' else r[3]
+            for gap in copy_gap(loads, lit.len):
+                imm = find_imm_tail(ins, r[1], r[2], orig, gap)
+                if imm is None: return None
+                for q, kind in imm:
+                    out.append((q, kind, nb[gap[0]:gap[1]]))
+        return out
+
     def inplace_safe(lit):
+        code = [r for r in lit.refs if r[0] in ('code', 'copy')]
         if lit.exact: return True
         if any(r[0] == 'load' for r in lit.refs): return False
-        code = [r for r in lit.refs if r[0] == 'code']
         if any(r[0] in ('derived', 'ptr') for r in lit.refs) and not code: return False
         return bool(code) and all(any(imm == lit.len for _, imm in r[3]) for r in code)
 
@@ -446,7 +529,8 @@ def make_plan(m: MachO, table, verbose=False):
         if len(zb) <= min(l.len for l in hits):
             for lit in hits:
                 nb = pad_to(zb, lit.len)
-                if utf8_consistent(lit, nb): inplace.append((lit, nb))
+                cp = copy_patches(lit, nb)
+                if utf8_consistent(lit, nb) and cp is not None: inplace.append((lit, nb, cp))
                 else: unsafe.append(en)
             continue
         # 需要搬迁：逐处检查引用是否都可改写
@@ -454,7 +538,8 @@ def make_plan(m: MachO, table, verbose=False):
         for lit in hits:
             if len(zb) <= lit.len:
                 nb = pad_to(zb, lit.len)
-                if utf8_consistent(lit, nb): inplace.append((lit, nb)); done += 1
+                cp = copy_patches(lit, nb)
+                if utf8_consistent(lit, nb) and cp is not None: inplace.append((lit, nb, cp)); done += 1
                 continue
             patches = []
             ok = bool(lit.refs)
@@ -465,6 +550,8 @@ def make_plan(m: MachO, table, verbose=False):
                     k = dedicated_movz(ins, r[1], r[2], r[3], lit.len)
                     if k is None: ok = False; break
                     patches.append(('code', r[1], r[2], k))
+                elif r[0] == 'copy':
+                    ok = False; break   # 内联拷贝的长度隐含在指令里，无法搬迁
                 else:  # load / derived / ptr（长度另存）：无法改写
                     ok = False; break
             if not ok:
@@ -486,7 +573,7 @@ def make_plan(m: MachO, table, verbose=False):
 
 
 def report(plan, table):
-    n_ok = len({l.text for l, _ in plan['inplace']} | {l.text for l, *_ in plan['relocs']})
+    n_ok = len({l.text for l, *_ in plan['inplace']} | {l.text for l, *_ in plan['relocs']})
     print(f"词条 {len(table)} 条：原位替换 {len(plan['inplace'])} 处，搬迁 {len(plan['relocs'])} 处，"
           f"覆盖 {n_ok} 条；跳过 {len(plan['skipped'])} 条；未找到 {len(plan['missing'])} 条；"
           f"剩余空闲空间 {plan['alloc'].remaining()} 字节")
@@ -504,9 +591,14 @@ def report(plan, table):
 def apply_plan(m: MachO, plan):
     buf = bytearray(m.data)
     text_addr, text_off, ins = plan['text_addr'], plan['text_off'], plan['ins']
-    for lit, nb in plan['inplace']:
+    for lit, nb, cp in plan['inplace']:
         assert buf[lit.off:lit.off + lit.len] == lit.text.encode('utf-8')
         buf[lit.off:lit.off + lit.len] = nb
+        for q, kind, tail in cp:
+            val = int.from_bytes(tail, 'little')
+            w = ins[q]
+            imm = (val & 0xFFFF) if kind == 'z' else (val >> 16)
+            struct.pack_into('<I', buf, text_off + q * 4, (w & ~(0xFFFF << 5)) | (imm << 5))
     for lit, zb, fo, patches in plan['relocs']:
         buf[fo:fo + len(zb)] = zb
         new_addr = m.fileoff_to_addr(fo)
