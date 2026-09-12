@@ -21,6 +21,7 @@ Delta 是闭源的 Rust/GPUI 应用，界面文字被直接编译进主程序二
     python3 delta_i18n.py check   [--app ...] [--dict ...]    # 只报告，不改动
     python3 delta_i18n.py restore [--app ...]                 # 还原成原版程序
     python3 delta_i18n.py dump    [--app ...] > strings.tsv   # 导出可翻译的字符串
+    python3 delta_i18n.py make-cert                           # 创建固定的自签名证书，避免钥匙串反复询问
 """
 import argparse, json, os, re, shutil, struct, subprocess, sys, tempfile
 from collections import defaultdict
@@ -683,9 +684,43 @@ def write_binary(app, out: bytes):
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+CERT_NAME = "Delta zh-CN Patch"
+
+
+def signing_identity():
+    """优先用固定的自签名证书（make-cert 创建），这样每次打补丁后签名身份不变，
+    钥匙串授权（"始终允许"）只需做一次；没有就退回 ad-hoc。"""
+    r = subprocess.run(['security', 'find-identity', '-v', '-p', 'codesigning'], capture_output=True, text=True)
+    return CERT_NAME if f'"{CERT_NAME}"' in r.stdout else '-'
+
+
+def do_make_cert():
+    if signing_identity() == CERT_NAME:
+        print(f"证书「{CERT_NAME}」已存在。"); return
+    tmp = tempfile.mkdtemp()
+    key, cert, p12 = (os.path.join(tmp, n) for n in ('key.pem', 'cert.pem', 'id.p12'))
+    subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '3650',
+                    '-keyout', key, '-out', cert, '-subj', f'/CN={CERT_NAME}',
+                    '-addext', 'keyUsage=critical,digitalSignature',
+                    '-addext', 'extendedKeyUsage=critical,codeSigning'], check=True, capture_output=True)
+    subprocess.run(['openssl', 'pkcs12', '-export', '-out', p12, '-inkey', key, '-in', cert,
+                    '-passout', 'pass:delta', '-macalg', 'sha1',                 # macOS 只认旧算法
+                    '-keypbe', 'PBE-SHA1-3DES', '-certpbe', 'PBE-SHA1-3DES'], check=True, capture_output=True)
+    keychain = os.path.expanduser('~/Library/Keychains/login.keychain-db')
+    subprocess.run(['security', 'import', p12, '-k', keychain, '-P', 'delta',
+                    '-T', '/usr/bin/codesign', '-T', '/usr/bin/security'], check=True)
+    print("接下来 macOS 会弹窗要求输入登录密码，用来把这张证书标记为「代码签名可信」……")
+    r = subprocess.run(['security', 'add-trusted-cert', '-r', 'trustRoot', '-p', 'codeSign', '-k', keychain, cert])
+    shutil.rmtree(tmp, ignore_errors=True)
+    if r.returncode != 0 or signing_identity() != CERT_NAME:
+        sys.exit("证书创建失败。可以继续使用 ad-hoc 签名（每次打补丁后钥匙串需重新点一次「始终允许」）。")
+    print(f"已创建证书「{CERT_NAME}」。之后 apply 会自动用它签名；重新执行 apply 即可生效。")
+
+
 def resign(app):
     ent = subprocess.run(['codesign', '-d', '--entitlements', ':-', app], capture_output=True).stdout
-    args = ['codesign', '--force', '--deep', '--sign', '-', '--options', 'runtime']
+    identity = signing_identity()
+    args = ['codesign', '--force', '--deep', '--sign', identity, '--options', 'runtime']
     tmpdir = tempfile.mkdtemp()
     if ent.strip():
         entf = os.path.join(tmpdir, 'delta.entitlements')
@@ -696,7 +731,9 @@ def resign(app):
     if r.returncode != 0:
         print(r.stderr); sys.exit("codesign 失败")
     subprocess.run(['xattr', '-dr', 'com.apple.quarantine', app], capture_output=True)
-    print("已重新签名（ad-hoc）。")
+    print("已重新签名（ad-hoc）。首次启动如弹出钥匙串询问，请点「始终允许」；"
+          "运行 `python3 delta_i18n.py make-cert` 可创建固定证书，避免每次打补丁后重复授权。"
+          if identity == '-' else f"已用证书「{identity}」重新签名。")
 
 def do_restore(app):
     bk = backup_path(app)
@@ -721,7 +758,7 @@ def do_dump(app):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('cmd', choices=['apply', 'check', 'restore', 'dump'])
+    ap.add_argument('cmd', choices=['apply', 'check', 'restore', 'dump', 'make-cert'])
     ap.add_argument('--app', default='/Applications/Delta.app')
     ap.add_argument('--dict', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'translations.json'))
     a = ap.parse_args()
@@ -729,6 +766,7 @@ def main():
     elif a.cmd == 'check': do_apply(a.app, a.dict, dry=True)
     elif a.cmd == 'restore': do_restore(a.app)
     elif a.cmd == 'dump': do_dump(a.app)
+    elif a.cmd == 'make-cert': do_make_cert()
 
 if __name__ == '__main__':
     main()
